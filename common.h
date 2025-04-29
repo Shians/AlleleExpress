@@ -24,8 +24,8 @@ constexpr uint16_t BAM_FQCFAIL = 0x200;
 constexpr uint16_t BAM_FDUP = 0x400;
 constexpr uint16_t BAM_FSUPPLEMENTARY = 0x800;
 
-// Default exclude flags (matching samtools mpileup defaults: SECONDARY,QCFAIL,DUP)
-constexpr uint16_t DEFAULT_EXCLUDE_FLAGS = BAM_FSECONDARY | BAM_FQCFAIL | BAM_FDUP;
+// Default exclude flags - now excluding secondary, qcfail, duplicates, and supplementary alignments
+constexpr uint16_t DEFAULT_EXCLUDE_FLAGS = BAM_FSECONDARY | BAM_FQCFAIL | BAM_FDUP | BAM_FSUPPLEMENTARY;
 
 // Read filtering flags enum for additional filtering options beyond flags
 enum class ReadFilterFlag : uint32_t {

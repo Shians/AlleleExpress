@@ -63,6 +63,7 @@ int main(int argc, char* argv[]) {
 
         // Initialize readers
         auto bam_reader = std::make_unique<BamReader>(bam_filename);
+
         auto bed_reader = std::make_unique<BedReader>(bed_filename, ref_filename);
 
         // Initialize counter
