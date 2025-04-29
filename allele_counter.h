@@ -5,6 +5,7 @@
 
 #include "common.h"
 #include "bam_reader.h"
+#include "variant.h"
 
 class AlleleCounter {
 public:

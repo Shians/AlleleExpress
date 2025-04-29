@@ -36,7 +36,7 @@ VariantResult AlleleCounter::count_alleles(const Variant& variant,
     bam_reader_->for_each_base_at_position(
         variant.chromosome,
         variant.position,
-        [&](char base_char, uint8_t base_quality) {
+        [&](char base_char, uint8_t base_quality, const BamAlignment* alignment) {
             // Ignore 'N' bases
             if (base_char == 'N') {
                 return;

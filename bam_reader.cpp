@@ -42,8 +42,8 @@ BamReader::BamReader(const std::string& filename)
         throw std::runtime_error("Failed to open BAM file: " + filename);
     }
 
-    // Check if the file is BAM/CRAM
-    if (file_->format.format != htsExactFormat::cram && file_->format.format != htsExactFormat::bam) {
+    // Check if the file is BAM
+    if (file_->format.format != htsExactFormat::bam) {
         throw std::runtime_error("Input file must be a BAM or CRAM file");
     }
 
@@ -70,7 +70,7 @@ BamReader::BamReader(const std::string& filename)
     // By default, don't count orphans and handle overlapping pairs
     // These match samtools mpileup defaults
     filter_params_.set_flag(ReadFilterFlag::COUNT_ORPHANS, false);
-    filter_params_.set_flag(ReadFilterFlag::IGNORE_OVERLAPS, false);
+    filter_params_.set_flag(ReadFilterFlag::DISABLE_OVERLAP, false);
 }
 
 BamReader::~BamReader() = default;
