@@ -10,7 +10,7 @@ AlleleExpress is a fast C++ utility for calculating allele frequencies from BAM 
 
 ## Requirements
 
-- C++23 compatible compiler (GCC 7+ or Clang 5+)
+- C++23 compatible compiler (GCC 13+ or Clang 17+)
 - CMake 3.14 or higher
 - HTSlib 1.9 or higher
 
@@ -35,7 +35,23 @@ cmake --build build
 3. Install (optional):
 
 ```bash
-sudo make install
+# Default system-wide installation (requires sudo)
+sudo cmake --install build
+```
+
+### Custom Installation Location
+If you want to install to a custom location, you can specify the `CMAKE_INSTALL_PREFIX` option:
+
+```bash
+cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/path/to/custom/install/location
+cmake --build build
+cmake --install build
+```
+
+If you use a custom installation location, you may need to update your PATH:
+
+```bash
+export PATH=/path/to/custom/install/location/bin:$PATH
 ```
 
 ## Usage
