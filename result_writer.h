@@ -5,6 +5,7 @@
 #include <fstream>
 
 #include "common.h"
+#include "variant.h"
 
 class ResultWriter {
 public:

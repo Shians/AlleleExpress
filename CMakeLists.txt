@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(pileup_cpp VERSION 0.1.0)
+project(AlleleExpress VERSION 1.0.0)
 
 # Use C++23
 set(CMAKE_CXX_STANDARD 23)
@@ -50,11 +50,13 @@ set(SOURCES
     bed_reader.cpp
     allele_counter.cpp
     result_writer.cpp
+    variant.cpp
 )
 
 # Define header files
 set(HEADERS
     common.h
+    variant.h
     bam_reader.h
     bed_reader.h
     allele_counter.h
@@ -63,10 +65,10 @@ set(HEADERS
 )
 
 # Create the executable
-add_executable(pileup_cpp ${SOURCES} ${HEADERS})
+add_executable(allele-express ${SOURCES} ${HEADERS})
 
 # Link against htslib
-target_link_libraries(pileup_cpp ${HTSLIB_LIBRARY})
+target_link_libraries(allele-express ${HTSLIB_LIBRARY})
 
 # Install targets
-install(TARGETS pileup_cpp DESTINATION bin)
+install(TARGETS allele-express DESTINATION bin)

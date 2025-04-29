@@ -11,9 +11,9 @@
 
 int main(int argc, char* argv[]) {
     // Set up argument parser
-    argparse::ArgumentParser program("pileup_cpp", "1.0.0");
+    argparse::ArgumentParser program("allele-express", "1.0.0");
 
-    program.add_description("A C++ utility for calculating allele frequencies from BAM files at BED positions");
+    program.add_description("AlleleExpress: A C++ utility for calculating allele frequencies from BAM files at specified genomic positions");
 
     program.add_argument("bam_file")
         .help("Input BAM file (must be indexed)");
@@ -49,7 +49,7 @@ int main(int argc, char* argv[]) {
         program.parse_args(argc, argv);
 
         if (program.get<bool>("--version")) {
-            std::cout << "pileup_cpp version 1.0.0" << std::endl;
+            std::cout << "AlleleExpress version 1.0.0" << std::endl;
             return 0;
         }
 
