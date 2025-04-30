@@ -105,3 +105,4 @@ This project is licensed under the Apache License 2.0. See the [LICENSE](LICENSE
 
 - This project uses the [argparse](https://github.com/p-ranav/argparse) library for command-line argument parsing
 - HTSlib for BAM file handling
+- VS Code Agentic AI with Claude 3.7 for code generation and documentation
