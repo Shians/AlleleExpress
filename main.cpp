@@ -3,6 +3,7 @@
 #include <memory>
 #include <vector>
 #include <future>
+#include <map>
 
 #include "argparse/argparse.hpp"
 #include "bam_reader.h"
@@ -87,8 +88,7 @@ int main(int argc, char* argv[]) {
         std::cerr << "Processing " << positions.size() << " positions using " << num_threads << " threads..." << std::endl;
 
         // Submit jobs to the thread pool and collect futures
-        std::vector<std::future<VariantResult>> futures;
-        futures.reserve(positions.size());
+        std::vector<std::future<std::vector<VariantResult>>> futures;
 
         // Create allele counters for each thread (thread-safe approach)
         std::vector<std::unique_ptr<AlleleCounter>> counters;
@@ -96,29 +96,57 @@ int main(int argc, char* argv[]) {
             counters.push_back(std::make_unique<AlleleCounter>(bam_reader.get()));
         }
 
-        // Process positions in parallel
-        for (size_t i = 0; i < positions.size(); ++i) {
-            // Use counter from the thread's index mod number of threads
-            int counter_index = i % num_threads;
-
-            auto future = thread_pool.enqueue(
-                [&counters, counter_index, &positions, i, min_base_quality, min_mapping_quality]() {
-                    return counters[counter_index]->count_alleles(
-                        positions[i],
-                        min_base_quality,
-                        min_mapping_quality
-                    );
-                }
-            );
-            futures.push_back(std::move(future));
+        // Group positions by chromosome for batch processing
+        std::map<std::string, std::vector<Variant>> chromosome_positions;
+        for (const auto& pos : positions) {
+            chromosome_positions[pos.chromosome].push_back(pos);
         }
 
-        // Collect results in original order
-        std::vector<VariantResult> results;
-        results.reserve(futures.size());
+        std::cerr << "Grouped positions across " << chromosome_positions.size() << " chromosomes." << std::endl;
 
+        // Counter for tracking assigned batches
+        size_t batch_counter = 0;
+
+        // Process positions in chromosome-based batches
+        for (auto& [chromosome, chrom_positions] : chromosome_positions) {
+            // Process up to 50 positions per batch
+            for (size_t batch_start = 0; batch_start < chrom_positions.size(); batch_start += 50) {
+                // Calculate the end position of the current batch
+                size_t batch_end = std::min(batch_start + 50, chrom_positions.size());
+
+                // Select counter index based on batch counter
+                int counter_index = batch_counter % num_threads;
+                batch_counter++;
+
+                // Create a batch of positions for processing
+                std::vector<Variant> batch(chrom_positions.begin() + batch_start, chrom_positions.begin() + batch_end);
+
+                auto future = thread_pool.enqueue(
+                    [&counters, counter_index, batch, min_base_quality, min_mapping_quality]() {
+                        std::vector<VariantResult> batch_results;
+                        batch_results.reserve(batch.size());
+
+                        for (const auto& pos : batch) {
+                            batch_results.push_back(counters[counter_index]->count_alleles(
+                                pos,
+                                min_base_quality,
+                                min_mapping_quality
+                            ));
+                        }
+
+                        return batch_results;
+                    }
+                );
+
+                futures.push_back(std::move(future));
+            }
+        }
+
+        // Collect and flatten results
+        std::vector<VariantResult> results;
         for (auto& future : futures) {
-            results.push_back(future.get());
+            auto batch_results = future.get();
+            results.insert(results.end(), batch_results.begin(), batch_results.end());
         }
 
         // Write results
