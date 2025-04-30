@@ -38,3 +38,4 @@ core
 # Local scripts
 build.sh
 run.sh
+benchmark.sh
