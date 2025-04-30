@@ -7,6 +7,7 @@
 #include <functional>
 #include <optional>
 #include <unordered_map>
+#include <mutex>
 #include "common.h"
 
 // Forward declarations of htslib types
@@ -366,6 +367,7 @@ private:
     std::unique_ptr<bam1_t, std::function<void(bam1_t*)>> read_;
     bool has_more_reads_ = false;
     BamFilterParams filter_params_;
+    mutable std::mutex mutex_; // Mutex for thread safety
 };
 
 #endif // BAM_READER_H

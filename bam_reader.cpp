@@ -173,6 +173,7 @@ std::vector<std::string> BamReader::get_sequence_names() const {
 }
 
 bool BamReader::set_region(const std::string& chrom, int32_t start, int32_t end) {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (!header_ || !index_) {
         return false;
     }
@@ -198,6 +199,7 @@ bool BamReader::set_region(const std::string& chrom, int32_t start, int32_t end)
 }
 
 bool BamReader::set_region(const std::string& region_str) {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (!header_ || !index_) {
         return false;
     }
@@ -216,14 +218,30 @@ bool BamReader::set_region(const std::string& region_str) {
     int32_t start = std::stoi(matches[2].str());
     int32_t end = std::stoi(matches[3].str());
 
-    return set_region(chrom, start, end);
+    // Call the other set_region without lock since we already have the lock
+    int tid = bam_name2id(header_.get(), chrom.c_str());
+    if (tid < 0) {
+        return false;
+    }
+
+    // Create new iterator for the region
+    iterator_.reset(sam_itr_queryi(index_.get(), tid, start - 1, end)); // 0-based coordinates
+    if (!iterator_) {
+        return false;
+    }
+
+    // Get the first read
+    has_more_reads_ = next_read();
+    return has_more_reads_;
 }
 
 bool BamReader::has_next_read() const {
+    std::lock_guard<std::mutex> lock(mutex_);
     return has_more_reads_;
 }
 
 bool BamReader::next_read() {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (!iterator_ || !read_) {
         has_more_reads_ = false;
         return false;
@@ -467,6 +485,7 @@ std::string BamReader::get_tag_value(const bam1_t* b, const char* tag_name) cons
 }
 
 std::optional<BamAlignment> BamReader::get_current_alignment() const {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (!has_more_reads_ || !read_) {
         return std::nullopt;
     }
@@ -496,21 +515,34 @@ std::vector<BamAlignment> BamReader::get_overlapping_reads(const std::string& ch
     // Use filter params mapping quality if not specified
     int mapq_threshold = (min_mapping_quality >= 0) ? min_mapping_quality : filter_params_.min_mapping_quality;
 
-    // Set region to include the position with some padding
+    // Set region already acquires the lock
     if (!set_region(chrom, position, position + 1)) {
         return reads;
     }
+
+    // Lock mutex for the duration of this method
+    std::lock_guard<std::mutex> lock(mutex_);
 
     // Limit the number of reads according to max_depth
     int read_count = 0;
 
     // Process each read overlapping the position
-    while (has_next_read() && (filter_params_.max_depth <= 0 || read_count < filter_params_.max_depth)) {
+    while (has_more_reads_ && (filter_params_.max_depth <= 0 || read_count < filter_params_.max_depth)) {
         auto* b = read_.get();
 
         // Skip if mapping quality is too low
         if (b->core.qual < mapq_threshold) {
-            next_read();
+            // Call next_read directly without lock since we already have it
+            int ret;
+            do {
+                ret = sam_itr_next(file_.get(), iterator_.get(), read_.get());
+                if (ret < 0) {
+                    has_more_reads_ = false;
+                    break;
+                }
+            } while (!passes_filters(read_.get()));
+
+            has_more_reads_ = (ret >= 0);
             continue;
         }
 
@@ -519,14 +551,34 @@ std::vector<BamAlignment> BamReader::get_overlapping_reads(const std::string& ch
 
         // Check if position is covered by this read
         if (pos0 >= b->core.pos && pos0 < bam_endpos(b)) {
-            auto alignment = get_current_alignment();
-            if (alignment) {
-                reads.push_back(*alignment);
-                read_count++;
-            }
+            BamAlignment alignment;
+
+            // Create alignment directly without calling get_current_alignment to avoid recursive locking
+            alignment.query_name = bam_get_qname(b);
+            alignment.chrom = get_sequence_name(b->core.tid);
+            alignment.position = b->core.pos + 1;  // Convert to 1-based
+            alignment.mapping_quality = b->core.qual;
+            alignment.flag = b->core.flag;
+            alignment.is_reverse_strand = (b->core.flag & BAM_FREVERSE) != 0;
+            alignment.cigar_string = get_cigar_string(b);
+            alignment.seq = get_sequence_string(b);
+            alignment.qual = get_quality_string(b);
+
+            reads.push_back(alignment);
+            read_count++;
         }
 
-        next_read();
+        // Call next_read directly without lock since we already have it
+        int ret;
+        do {
+            ret = sam_itr_next(file_.get(), iterator_.get(), read_.get());
+            if (ret < 0) {
+                has_more_reads_ = false;
+                break;
+            }
+        } while (!passes_filters(read_.get()));
+
+        has_more_reads_ = (ret >= 0);
     }
 
     return reads;
@@ -549,28 +601,71 @@ void BamReader::for_each_base_at_position(
     int base_qual_threshold = (min_base_quality >= 0) ? min_base_quality : filter_params_.min_base_quality;
     int mapq_threshold = (min_mapping_quality >= 0) ? min_mapping_quality : filter_params_.min_mapping_quality;
 
-    // Set region to include the position of interest and some padding
-    if (!set_region(chrom, position, position + 1)) {
-        return;
-    }
-
     // Temporary storage for potentially overlapping reads
     std::vector<const bam1_t*> reads;
     std::vector<BamAlignment> alignments;
     std::vector<char> bases;
     std::vector<uint8_t> qualities;
     std::unordered_map<const bam1_t*, size_t> read_indices;
-
-    // Limit the number of reads according to max_depth
     int read_count = 0;
 
+    // We need to lock for the entire duration of this operation
+    // to prevent iterator_ and read_ from being modified by other threads
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    // Set region (directly, without using the public method which would try to acquire the lock again)
+    if (!header_ || !index_) {
+        return;
+    }
+
+    // Clean up previous iterator if it exists
+    iterator_.reset();
+
+    // Get chromosome ID from name
+    int tid = bam_name2id(header_.get(), chrom.c_str());
+    if (tid < 0) {
+        return;
+    }
+
+    // Create new iterator for the region
+    iterator_.reset(sam_itr_queryi(index_.get(), tid, position - 1, position)); // 0-based coordinates
+    if (!iterator_) {
+        return;
+    }
+
+    // Need to initialize has_more_reads_ by calling next_read directly here
+    if (!read_) {
+        has_more_reads_ = false;
+        return;
+    }
+
+    // Get the first read
+    int ret;
+    do {
+        ret = sam_itr_next(file_.get(), iterator_.get(), read_.get());
+        if (ret < 0) {
+            has_more_reads_ = false;
+            return;
+        }
+    } while (!passes_filters(read_.get()));
+
+    has_more_reads_ = true;
+
     // Process each read overlapping the position
-    while (has_next_read() && (filter_params_.max_depth <= 0 || read_count < filter_params_.max_depth)) {
+    while (has_more_reads_ && (filter_params_.max_depth <= 0 || read_count < filter_params_.max_depth)) {
         auto* b = read_.get();
 
         // Skip if mapping quality is too low
         if (b->core.qual < mapq_threshold) {
-            next_read();
+            do {
+                ret = sam_itr_next(file_.get(), iterator_.get(), read_.get());
+                if (ret < 0) {
+                    has_more_reads_ = false;
+                    break;
+                }
+            } while (!passes_filters(read_.get()));
+
+            has_more_reads_ = (ret >= 0);
             continue;
         }
 
@@ -579,7 +674,15 @@ void BamReader::for_each_base_at_position(
 
         // Skip if position is not covered by this read
         if (pos0 < b->core.pos || pos0 >= bam_endpos(b)) {
-            next_read();
+            do {
+                ret = sam_itr_next(file_.get(), iterator_.get(), read_.get());
+                if (ret < 0) {
+                    has_more_reads_ = false;
+                    break;
+                }
+            } while (!passes_filters(read_.get()));
+
+            has_more_reads_ = (ret >= 0);
             continue;
         }
 
@@ -592,14 +695,19 @@ void BamReader::for_each_base_at_position(
         int ref_pos = b->core.pos;  // Position on the reference
         uint32_t* cigar = bam_get_cigar(b);
 
-        // Get current alignment for passing to the processor
-        auto alignment = get_current_alignment();
-        if (!alignment) {
-            next_read();
-            continue;
-        }
+        // Create alignment directly without calling get_current_alignment to avoid recursive locking
+        BamAlignment alignment;
+        alignment.query_name = bam_get_qname(b);
+        alignment.chrom = get_sequence_name(b->core.tid);
+        alignment.position = b->core.pos + 1;  // Convert to 1-based
+        alignment.mapping_quality = b->core.qual;
+        alignment.flag = b->core.flag;
+        alignment.is_reverse_strand = (b->core.flag & BAM_FREVERSE) != 0;
+        alignment.cigar_string = get_cigar_string(b);
+        alignment.seq = get_sequence_string(b);
+        alignment.qual = get_quality_string(b);
 
-        alignments.push_back(*alignment);
+        alignments.push_back(alignment);
 
         // Traverse the CIGAR string
         for (uint32_t i = 0; i < b->core.n_cigar; ++i) {
@@ -665,7 +773,16 @@ void BamReader::for_each_base_at_position(
         }
 
 end_cigar_loop:
-        next_read();
+        // Get the next read without using next_read() since we already have the lock
+        do {
+            ret = sam_itr_next(file_.get(), iterator_.get(), read_.get());
+            if (ret < 0) {
+                has_more_reads_ = false;
+                break;
+            }
+        } while (!passes_filters(read_.get()));
+
+        has_more_reads_ = (ret >= 0);
     }
 
     // Handle overlapping pairs if needed
@@ -673,12 +790,20 @@ end_cigar_loop:
         handle_overlapping_pairs(bases, qualities, read_indices, reads);
     }
 
+    // Release the lock before calling the processor function as it might be slow
+    // and we don't want to keep the lock for longer than necessary
+    // We need to make a copy of the data that will be processed
+    mutex_.unlock();
+
     // Process the bases with the processor function
     for (size_t i = 0; i < bases.size(); ++i) {
         if (qualities[i] >= base_qual_threshold) {
             processor(bases[i], qualities[i], &alignments[i]);
         }
     }
+
+    // Reacquire the lock before returning (as required by unlock() in lock_guard's destructor)
+    mutex_.lock();
 }
 
 void BamReader::handle_overlapping_pairs(

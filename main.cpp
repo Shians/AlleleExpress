@@ -2,12 +2,14 @@
 #include <string>
 #include <memory>
 #include <vector>
+#include <future>
 
 #include "argparse/argparse.hpp"
 #include "bam_reader.h"
 #include "bed_reader.h"
 #include "allele_counter.h"
 #include "result_writer.h"
+#include "thread_pool.h"
 
 int main(int argc, char* argv[]) {
     // Set up argument parser
@@ -40,6 +42,11 @@ int main(int argc, char* argv[]) {
         .scan<'i', int>()
         .default_value(DEFAULT_MIN_MAPPING_QUALITY);
 
+    program.add_argument("-t", "--threads")
+        .help("Number of threads to use (default: number of available CPU cores)")
+        .scan<'i', int>()
+        .default_value(DEFAULT_N_THREADS);
+
     program.add_argument("-v", "--version")
         .help("Print version information and exit")
         .default_value(false)
@@ -60,24 +67,58 @@ int main(int argc, char* argv[]) {
         std::string output_filename = program.get("--output");
         int min_base_quality = program.get<int>("--min-base-quality");
         int min_mapping_quality = program.get<int>("--min-mapping-quality");
+        int num_threads = program.get<int>("--threads");
+
+        std::cerr << "Using " << num_threads << " threads for variant processing." << std::endl;
 
         // Initialize readers
         auto bam_reader = std::make_unique<BamReader>(bam_filename);
-
         auto bed_reader = std::make_unique<BedReader>(bed_filename, ref_filename);
 
-        // Initialize counter
-        auto allele_counter = std::make_unique<AlleleCounter>(bam_reader.get());
+        // Create a threadpool with the specified number of threads
+        ThreadPool thread_pool(num_threads);
 
-        // Process BED positions
-        std::vector<VariantResult> results;
+        // Read all positions into memory (could be optimized for very large BED files)
+        std::vector<Variant> positions;
         while (auto position = bed_reader->next_position()) {
-            auto result = allele_counter->count_alleles(
-                *position,
-                min_base_quality,
-                min_mapping_quality
+            positions.push_back(*position);
+        }
+
+        std::cerr << "Processing " << positions.size() << " positions using " << num_threads << " threads..." << std::endl;
+
+        // Submit jobs to the thread pool and collect futures
+        std::vector<std::future<VariantResult>> futures;
+        futures.reserve(positions.size());
+
+        // Create allele counters for each thread (thread-safe approach)
+        std::vector<std::unique_ptr<AlleleCounter>> counters;
+        for (int i = 0; i < num_threads; ++i) {
+            counters.push_back(std::make_unique<AlleleCounter>(bam_reader.get()));
+        }
+
+        // Process positions in parallel
+        for (size_t i = 0; i < positions.size(); ++i) {
+            // Use counter from the thread's index mod number of threads
+            int counter_index = i % num_threads;
+
+            auto future = thread_pool.enqueue(
+                [&counters, counter_index, &positions, i, min_base_quality, min_mapping_quality]() {
+                    return counters[counter_index]->count_alleles(
+                        positions[i],
+                        min_base_quality,
+                        min_mapping_quality
+                    );
+                }
             );
-            results.push_back(result);
+            futures.push_back(std::move(future));
+        }
+
+        // Collect results in original order
+        std::vector<VariantResult> results;
+        results.reserve(futures.size());
+
+        for (auto& future : futures) {
+            results.push_back(future.get());
         }
 
         // Write results

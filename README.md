@@ -14,7 +14,7 @@ AlleleExpress is a fast C++ utility for calculating allele frequencies from BAM 
 
 ## Requirements
 
-- C++23 compatible compiler (GCC 13+ or Clang 17+)
+- C++23 compatible compiler (GCC 13+ or Clang 15+)
 - CMake 3.14 or higher
 - HTSlib 1.9 or higher
 
