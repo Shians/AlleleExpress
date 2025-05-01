@@ -14,20 +14,6 @@
 #include <htslib/hts.h>
 #include <htslib/faidx.h>
 
-// BAM flags from htslib/sam.h
-#define BAM_FPAIRED        1   // paired-end / multiple segment sequencing
-#define BAM_FPROPER_PAIR   2   // each segment properly aligned
-#define BAM_FUNMAP         4   // segment unmapped
-#define BAM_FMUNMAP        8   // next segment unmapped
-#define BAM_FREVERSE      16   // SEQ is reverse complemented
-#define BAM_FMREVERSE     32   // SEQ of next segment reversed
-#define BAM_FREAD1        64   // first segment in template
-#define BAM_FREAD2       128   // last segment in template
-#define BAM_FSECONDARY   256   // not primary alignment
-#define BAM_FQCFAIL      512   // quality control failure
-#define BAM_FDUP        1024   // PCR or optical duplicate
-#define BAM_FSUPPLEMENTARY 2048 // supplementary alignment
-
 BamReader::BamReader(const std::string& filename)
     : filename_(filename)
     , file_(nullptr, [](htsFile* f) { if (f) hts_close(f); })
@@ -211,7 +197,7 @@ bool BamReader::next_read() {
 
 bool BamReader::passes_filters(const bam1_t* b) const {
     // Always filter out unmapped reads
-    if ((b->core.flag & BAM_FUNMAP) || b->core.tid < 0) {
+    if (has_flag(b->core.flag, BamFlag::UNMAPPED) || b->core.tid < 0) {
         return false;
     }
 
@@ -233,8 +219,8 @@ bool BamReader::passes_filters(const bam1_t* b) const {
 
     // Check if we should count orphans - by default, samtools doesn't count orphans (-A to count them)
     if (!filter_params_.has_flag(ReadFilterFlag::COUNT_ORPHANS) &&
-        (b->core.flag & BAM_FPAIRED) &&
-        !(b->core.flag & BAM_FPROPER_PAIR)) {
+        has_flag(b->core.flag, BamFlag::PAIRED) &&
+        !has_flag(b->core.flag, BamFlag::PROPER_PAIR)) {
         return false;
     }
 
@@ -475,7 +461,7 @@ bool BamReader::process_read_at_position(
     alignment.position = read->core.pos + 1;  // Convert to 1-based
     alignment.mapping_quality = read->core.qual;
     alignment.flag = read->core.flag;
-    alignment.is_reverse_strand = (read->core.flag & BAM_FREVERSE) != 0;
+    alignment.is_reverse_strand = has_flag(read->core.flag, BamFlag::REVERSE_STRAND);
     alignment.cigar_string = get_cigar_string(read);
     alignment.seq = get_sequence_string(read);
     alignment.qual = get_quality_string(read);
@@ -670,13 +656,13 @@ void BamReader::handle_overlapping_pairs(
                 const bam1_t* r1 = alignments[idx1];
                 const bam1_t* r2 = alignments[idx2];
 
-                if (!(r1->core.flag & BAM_FPAIRED) || !(r2->core.flag & BAM_FPAIRED)) {
+                if (!has_flag(r1->core.flag, BamFlag::PAIRED) || !has_flag(r2->core.flag, BamFlag::PAIRED)) {
                     continue;
                 }
 
                 // Check if these are proper pairs (opposite strands)
-                bool r1_reverse = r1->core.flag & BAM_FREVERSE;
-                bool r2_reverse = r2->core.flag & BAM_FREVERSE;
+                bool r1_reverse = has_flag(r1->core.flag, BamFlag::REVERSE_STRAND);
+                bool r2_reverse = has_flag(r2->core.flag, BamFlag::REVERSE_STRAND);
 
                 if (r1_reverse == r2_reverse) {
                     continue; // Not opposite strands

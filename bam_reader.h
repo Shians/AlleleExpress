@@ -50,7 +50,7 @@ struct BamFilterParams {
 
     // Methods to check/set flags
     bool has_flag(ReadFilterFlag flag) const {
-        return (flags & static_cast<uint32_t>(flag)) != 0;
+        return (flags & std::to_underlying(flag)) != 0;
     }
 
     void set_flag(ReadFilterFlag flag, bool value = true) {

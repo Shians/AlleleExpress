@@ -4,46 +4,51 @@
 #include <string>
 #include <vector>
 #include <array>
+#include <utility>
 
 // Default filter parameters (matching samtools mpileup defaults)
 constexpr int DEFAULT_MIN_BASE_QUALITY = 13;    // -Q option in samtools mpileup
 constexpr int DEFAULT_MIN_MAPPING_QUALITY = 0;  // -q option in samtools mpileup
 constexpr int DEFAULT_MAX_DEPTH = 8000;         // -d option in samtools mpileup
 
-// BAM flags
-constexpr uint16_t BAM_FPAIRED = 0x1;
-constexpr uint16_t BAM_FPROPER_PAIR = 0x2;
-constexpr uint16_t BAM_FUNMAP = 0x4;
-constexpr uint16_t BAM_FMUNMAP = 0x8;
-constexpr uint16_t BAM_FREVERSE = 0x10;
-constexpr uint16_t BAM_FMREVERSE = 0x20;
-constexpr uint16_t BAM_FREAD1 = 0x40;
-constexpr uint16_t BAM_FREAD2 = 0x80;
-constexpr uint16_t BAM_FSECONDARY = 0x100;
-constexpr uint16_t BAM_FQCFAIL = 0x200;
-constexpr uint16_t BAM_FDUP = 0x400;
-constexpr uint16_t BAM_FSUPPLEMENTARY = 0x800;
+// BAM flags as an enum class for type safety
+enum class BamFlag : uint16_t {
+    PAIRED           = 0x0001,  // Paired-end / multiple segment sequencing
+    PROPER_PAIR      = 0x0002,  // Each segment properly aligned
+    UNMAPPED         = 0x0004,  // Segment unmapped
+    MATE_UNMAPPED    = 0x0008,  // Next segment unmapped
+    REVERSE_STRAND   = 0x0010,  // SEQ is reverse complemented
+    MATE_REVERSE     = 0x0020,  // SEQ of next segment reversed
+    READ1            = 0x0040,  // First segment in template
+    READ2            = 0x0080,  // Last segment in template
+    SECONDARY        = 0x0100,  // Not primary alignment
+    QC_FAIL          = 0x0200,  // Quality control failure
+    DUPLICATE        = 0x0400,  // PCR or optical duplicate
+    SUPPLEMENTARY    = 0x0800   // Supplementary alignment
+};
+
+// Helper functions for BamFlag
+constexpr uint16_t flag_bits(BamFlag flag) {
+    return std::to_underlying(flag);
+}
+
+inline bool has_flag(uint16_t flags, BamFlag flag) {
+    return (flags & flag_bits(flag)) != 0;
+}
 
 // Default exclude flags - now excluding secondary, qcfail, duplicates, and supplementary alignments
-constexpr uint16_t DEFAULT_EXCLUDE_FLAGS = BAM_FSECONDARY | BAM_FQCFAIL | BAM_FDUP | BAM_FSUPPLEMENTARY;
+constexpr uint16_t DEFAULT_EXCLUDE_FLAGS =
+    flag_bits(BamFlag::SECONDARY) |
+    flag_bits(BamFlag::QC_FAIL) |
+    flag_bits(BamFlag::DUPLICATE) |
+    flag_bits(BamFlag::SUPPLEMENTARY);
 
 // Read filtering flags enum for additional filtering options beyond flags
-enum class ReadFilterFlag : uint32_t {
-    DISABLE_BAQ = 1 << 0,              // -B option: disable BAQ (Base Alignment Quality)
-    RECALCULATE_BAQ = 1 << 1,          // -E option: recalculate BAQ on the fly
-    ILLUMINA13_QUALITY = 1 << 2,       // -6 option: assume quality is in Illumina-1.3+ format
-    COUNT_ORPHANS = 1 << 3,            // -A option: count anomalous read pairs
-    DISABLE_OVERLAP = 1 << 4,          // -x option: disable read-pair overlap detection
-    IGNORE_RG = 1 << 5,                // -R option: ignore read groups specified with -r
-    ADJUST_MQ = 1 << 6,                // -C option: adjust mapping quality
-    FILTER_UNMAPPED = 1 << 7,          // Always exclude unmapped reads
-    NO_INDELS = 1 << 8,                // -I option: don't include indels
-    FILTER_CLIPPED = 1 << 9,           // Filter out reads with large clips
-    MIN_DEPTH_FILTER = 1 << 10,        // Apply minimum depth filter
-    MAX_DEPTH_FILTER = 1 << 11,        // Apply maximum depth filter
-    REPORT_DELETIONS = 1 << 12,        // Report deletions as extended CIGAR ('*')
-    REPORT_INSERTIONS = 1 << 13,       // Report insertions as extended CIGAR ('+[ACGT]+')
-    REPORT_MQUAL = 1 << 14             // Report mapping quality
+enum class ReadFilterFlag : uint16_t {
+    COUNT_ORPHANS      = 1 << 1,       // -A option: count anomalous read pairs
+    DISABLE_OVERLAP    = 1 << 2,       // -x option: disable read-pair overlap detection
+    FILTER_CLIPPED     = 1 << 3,       // Filter out reads with large clips
+    ILLUMINA13_QUALITY = 1 << 4        // -6 option: assume quality is in Illumina-1.3+ format
 };
 
 // Structure to represent a variant allele
