@@ -65,7 +65,6 @@ BamReader::BamReader(const std::string& filename)
     filter_params_.max_depth = DEFAULT_MAX_DEPTH;
     filter_params_.exclude_flags = DEFAULT_EXCLUDE_FLAGS;
     filter_params_.required_flags = 0; // No flags required by default
-    filter_params_.adjust_mq_value = 0; // By default, don't adjust mapping quality
 
     // By default, don't count orphans and handle overlapping pairs
     // These match samtools mpileup defaults
@@ -108,37 +107,6 @@ const BamFilterParams& BamReader::get_filter_params() const {
     return filter_params_;
 }
 
-void BamReader::exclude_read_groups(const std::vector<std::string>& read_group_ids) {
-    for (const auto& rg : read_group_ids) {
-        filter_params_.excluded_read_groups[rg] = true;
-    }
-}
-
-bool BamReader::load_read_group_exclusions(const std::string& filename) {
-    std::ifstream file(filename);
-    if (!file.is_open()) {
-        return false;
-    }
-
-    std::string line;
-    while (std::getline(file, line)) {
-        // Skip empty lines and comments
-        if (line.empty() || line[0] == '#') {
-            continue;
-        }
-
-        // Trim whitespace
-        line.erase(0, line.find_first_not_of(" \t"));
-        line.erase(line.find_last_not_of(" \t") + 1);
-
-        if (!line.empty()) {
-            filter_params_.excluded_read_groups[line] = true;
-        }
-    }
-
-    return true;
-}
-
 std::string BamReader::get_sequence_name(int id) const {
     if (!header_ || id < 0 || id >= header_->n_targets) {
         return "";
@@ -151,25 +119,6 @@ int BamReader::get_sequence_id(const std::string& name) const {
         return -1;
     }
     return bam_name2id(header_.get(), name.c_str());
-}
-
-int32_t BamReader::get_sequence_length(int id) const {
-    if (!header_ || id < 0 || id >= header_->n_targets) {
-        return -1;
-    }
-    return header_->target_len[id];
-}
-
-std::vector<std::string> BamReader::get_sequence_names() const {
-    std::vector<std::string> names;
-    if (!header_) {
-        return names;
-    }
-
-    for (int i = 0; i < header_->n_targets; ++i) {
-        names.push_back(header_->target_name[i]);
-    }
-    return names;
 }
 
 bool BamReader::set_region(const std::string& chrom, int32_t start, int32_t end) {
@@ -316,142 +265,7 @@ bool BamReader::passes_filters(const bam1_t* b) const {
         }
     }
 
-    // Check read groups if needed
-    if (!filter_params_.excluded_read_groups.empty() && !filter_params_.has_flag(ReadFilterFlag::IGNORE_RG)) {
-        std::string rg = get_tag_value(b, "RG");
-        if (!rg.empty() && filter_params_.excluded_read_groups.count(rg) > 0) {
-            return false;
-        }
-    }
-
-    // Apply mapping quality adjustment if needed
-    if (filter_params_.adjust_mq_value > 0) {
-        uint8_t adjusted_mapq = adjust_mapping_quality(b);
-        if (adjusted_mapq < filter_params_.min_mapping_quality) {
-            return false;
-        }
-    }
-
     return true;
-}
-
-uint8_t BamReader::adjust_mapping_quality(const bam1_t* b) const {
-    // Skip adjustment if the coefficient is zero
-    if (filter_params_.adjust_mq_value <= 0) {
-        return b->core.qual;
-    }
-
-    // Original mapping quality
-    uint8_t mapq = b->core.qual;
-
-    // Count aligned bases with CIGAR operations M, X, =
-    uint32_t *cigar = bam_get_cigar(b);
-    uint32_t M = 0; // Count of aligned bases
-
-    for (uint32_t i = 0; i < b->core.n_cigar; ++i) {
-        uint32_t op = cigar[i] & BAM_CIGAR_MASK;
-        uint32_t len = cigar[i] >> BAM_CIGAR_SHIFT;
-
-        // Count match/mismatch operations
-        if (op == BAM_CMATCH || op == BAM_CEQUAL || op == BAM_CDIFF) {
-            M += len;
-        }
-    }
-
-    if (M == 0) {
-        return mapq; // No aligned bases
-    }
-
-    // Count substitutions with quality >= 13 and their quality sum
-    uint32_t X = 0; // Count of substitutions
-    uint32_t SubQ = 0; // Sum of substitution qualities (capped at 33)
-    uint32_t ClipQ = 0; // Sum of clip qualities
-
-    // Get reference and read sequences
-    uint8_t* seq = bam_get_seq(b);
-    uint8_t* qual = bam_get_qual(b);
-
-    // Get MD tag to identify mismatches
-    uint8_t* md_tag = bam_aux_get(b, "MD");
-    if (md_tag) {
-        const char* md_str = bam_aux2Z(md_tag);
-
-        // Parse MD string to count substitutions
-        int read_pos = 0;
-        int ref_pos = 0;
-        int md_len = strlen(md_str);
-        int num_matches = 0;
-
-        for (int i = 0; i < md_len; ++i) {
-            char c = md_str[i];
-            if (isdigit(c)) {
-                num_matches = num_matches * 10 + (c - '0');
-            } else if (c == '^') {
-                // Skip deletion
-                while (i + 1 < md_len && !isdigit(md_str[i + 1])) {
-                    i++;
-                }
-            } else {
-                // This is a substitution
-                if (read_pos < b->core.l_qseq && qual[read_pos] >= 13) {
-                    X++;
-                    SubQ += std::min(33, (int)qual[read_pos]);
-                }
-                read_pos++;
-                ref_pos++;
-
-                // Skip any more non-digit chars (usually just one base)
-                while (i + 1 < md_len && !isdigit(md_str[i + 1])) {
-                    i++;
-                }
-            }
-
-            if (i + 1 >= md_len || !isdigit(md_str[i + 1])) {
-                // Process accumulated matches
-                read_pos += num_matches;
-                ref_pos += num_matches;
-                num_matches = 0;
-            }
-        }
-    }
-
-    // Count soft and hard clips from CIGAR
-    for (uint32_t i = 0; i < b->core.n_cigar; ++i) {
-        uint32_t op = cigar[i] & BAM_CIGAR_MASK;
-        uint32_t len = cigar[i] >> BAM_CIGAR_SHIFT;
-
-        if (op == BAM_CSOFT_CLIP) {
-            // For soft-clipped bases, use actual quality scores
-            for (uint32_t j = 0; j < len; ++j) {
-                if (j < b->core.l_qseq) {
-                    ClipQ += qual[j];
-                }
-            }
-        } else if (op == BAM_CHARD_CLIP) {
-            // For hard-clipped bases, use quality 13
-            ClipQ += len * 13;
-        }
-    }
-
-    // Skip calculation if there are no mismatches
-    if (X == 0) {
-        return mapq;
-    }
-
-    // Calculate the T value from the formula
-    double logM = log10(M);
-    double logX = log10(X);
-    double logFac = 0;
-    for (uint32_t i = 1; i <= X; ++i) {
-        logFac += log10(i);
-    }
-    double T = SubQ - 10 * (X * logM - logFac) + ClipQ/5.0;
-
-    // Calculate mapping quality cap
-    double Cap = std::max(0.0, filter_params_.adjust_mq_value * sqrt((filter_params_.adjust_mq_value - T) / filter_params_.adjust_mq_value));
-
-    // Apply the cap to the original mapping quality
-    return static_cast<uint8_t>(std::min((double)mapq, Cap));
 }
 
 std::string BamReader::get_tag_value(const bam1_t* b, const char* tag_name) const {
@@ -484,110 +298,269 @@ std::string BamReader::get_tag_value(const bam1_t* b, const char* tag_name) cons
     }
 }
 
-std::optional<BamAlignment> BamReader::get_current_alignment() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!has_more_reads_ || !read_) {
-        return std::nullopt;
-    }
-
-    BamAlignment alignment;
-    auto* b = read_.get();
-
-    // Get alignment information
-    alignment.query_name = bam_get_qname(b);
-    alignment.chrom = get_sequence_name(b->core.tid);
-    alignment.position = b->core.pos + 1;  // Convert to 1-based
-    alignment.mapping_quality = b->core.qual;
-    alignment.flag = b->core.flag;
-    alignment.is_reverse_strand = (b->core.flag & BAM_FREVERSE) != 0;
-
-    // Get CIGAR, sequence, and quality
-    alignment.cigar_string = get_cigar_string(b);
-    alignment.seq = get_sequence_string(b);
-    alignment.qual = get_quality_string(b);
-
-    return alignment;
-}
-
-std::vector<BamAlignment> BamReader::get_overlapping_reads(const std::string& chrom, int32_t position, int min_mapping_quality) {
-    std::vector<BamAlignment> reads;
-
-    // Use filter params mapping quality if not specified
-    int mapq_threshold = (min_mapping_quality >= 0) ? min_mapping_quality : filter_params_.min_mapping_quality;
-
-    // Set region already acquires the lock
-    if (!set_region(chrom, position, position + 1)) {
-        return reads;
-    }
-
-    // Lock mutex for the duration of this method
-    std::lock_guard<std::mutex> lock(mutex_);
-
-    // Limit the number of reads according to max_depth
-    int read_count = 0;
-
-    // Process each read overlapping the position
-    while (has_more_reads_ && (filter_params_.max_depth <= 0 || read_count < filter_params_.max_depth)) {
-        auto* b = read_.get();
-
-        // Skip if mapping quality is too low
-        if (b->core.qual < mapq_threshold) {
-            // Call next_read directly without lock since we already have it
-            int ret;
-            do {
-                ret = sam_itr_next(file_.get(), iterator_.get(), read_.get());
-                if (ret < 0) {
-                    has_more_reads_ = false;
-                    break;
-                }
-            } while (!passes_filters(read_.get()));
-
-            has_more_reads_ = (ret >= 0);
-            continue;
-        }
-
-        // Convert position to 0-based
-        int pos0 = position - 1;
-
-        // Check if position is covered by this read
-        if (pos0 >= b->core.pos && pos0 < bam_endpos(b)) {
-            BamAlignment alignment;
-
-            // Create alignment directly without calling get_current_alignment to avoid recursive locking
-            alignment.query_name = bam_get_qname(b);
-            alignment.chrom = get_sequence_name(b->core.tid);
-            alignment.position = b->core.pos + 1;  // Convert to 1-based
-            alignment.mapping_quality = b->core.qual;
-            alignment.flag = b->core.flag;
-            alignment.is_reverse_strand = (b->core.flag & BAM_FREVERSE) != 0;
-            alignment.cigar_string = get_cigar_string(b);
-            alignment.seq = get_sequence_string(b);
-            alignment.qual = get_quality_string(b);
-
-            reads.push_back(alignment);
-            read_count++;
-        }
-
-        // Call next_read directly without lock since we already have it
-        int ret;
-        do {
-            ret = sam_itr_next(file_.get(), iterator_.get(), read_.get());
-            if (ret < 0) {
-                has_more_reads_ = false;
-                break;
-            }
-        } while (!passes_filters(read_.get()));
-
-        has_more_reads_ = (ret >= 0);
-    }
-
-    return reads;
-}
-
 char BamReader::base_as_char(uint8_t base) const {
     static const char bases[] = {'=', 'A', 'C', 'M', 'G', 'R', 'S', 'V',
                                 'T', 'W', 'Y', 'H', 'K', 'D', 'B', 'N'};
     return bases[base & 0xf];
+}
+
+// Helper method to set up an iterator for a genomic position
+bool BamReader::setup_position_iterator(const std::string& chrom, int32_t position) {
+    // Requirements check
+    if (!header_ || !index_) {
+        return false;
+    }
+
+    // Clean up previous iterator if it exists
+    iterator_.reset();
+
+    // Get chromosome ID from name
+    int tid = bam_name2id(header_.get(), chrom.c_str());
+    if (tid < 0) {
+        return false;
+    }
+
+    // Create new iterator for the region (position-1 because BAM uses 0-based coordinates)
+    iterator_.reset(sam_itr_queryi(index_.get(), tid, position - 1, position));
+    if (!iterator_) {
+        return false;
+    }
+
+    // Need to initialize read_ before using it
+    if (!read_) {
+        return false;
+    }
+
+    // Get the first read
+    int ret;
+    do {
+        ret = sam_itr_next(file_.get(), iterator_.get(), read_.get());
+        if (ret < 0) {
+            has_more_reads_ = false;
+            return false;
+        }
+    } while (!passes_filters(read_.get()));
+
+    has_more_reads_ = true;
+    return true;
+}
+
+// Helper method to fetch the next read that passes filters
+bool BamReader::fetch_next_filtered_read(int mapq_threshold) {
+    if (!iterator_ || !read_) {
+        has_more_reads_ = false;
+        return false;
+    }
+
+    int ret;
+    do {
+        ret = sam_itr_next(file_.get(), iterator_.get(), read_.get());
+        if (ret < 0) {
+            has_more_reads_ = false;
+            return false;
+        }
+
+        // Skip reads that don't pass the mapping quality threshold
+        if (read_->core.qual < mapq_threshold) {
+            continue;
+        }
+    } while (!passes_filters(read_.get()));
+
+    has_more_reads_ = (ret >= 0);
+    return has_more_reads_;
+}
+
+// Helper method to find the base in a read that corresponds to a reference position
+std::optional<std::tuple<char, uint8_t>> BamReader::find_base_at_ref_position(
+    const bam1_t* read,
+    int pos0
+) {
+    // Skip if position is not covered by this read
+    if (pos0 < read->core.pos || pos0 >= bam_endpos(read)) {
+        return std::nullopt;
+    }
+
+    // Get base and quality at the position
+    uint8_t* seq = bam_get_seq(read);
+    uint8_t* qual = bam_get_qual(read);
+
+    // Find the position in the read that aligns to our position of interest
+    int read_pos = 0;  // Position within the read
+    int ref_pos = read->core.pos;  // Position on the reference
+    uint32_t* cigar = bam_get_cigar(read);
+
+    // Traverse the CIGAR string
+    for (uint32_t i = 0; i < read->core.n_cigar; ++i) {
+        uint32_t op = cigar[i] & BAM_CIGAR_MASK;
+        uint32_t len = cigar[i] >> BAM_CIGAR_SHIFT;
+
+        switch(op) {
+            case BAM_CMATCH:  // M: match or mismatch
+            case BAM_CEQUAL:  // =: match
+            case BAM_CDIFF:   // X: mismatch
+                // If our position lies within this CIGAR operation
+                if (pos0 >= ref_pos && pos0 < ref_pos + static_cast<int>(len)) {
+                    int offset = pos0 - ref_pos;
+                    read_pos += offset;
+
+                    // Get base at this position
+                    int base_idx = read_pos;
+                    if (base_idx >= 0 && base_idx < read->core.l_qseq) {
+                        uint8_t base = bam_seqi(seq, base_idx);
+                        uint8_t base_qual = qual[base_idx];
+
+                        // For Illumina 1.3+ encoding, convert quality
+                        if (filter_params_.has_flag(ReadFilterFlag::ILLUMINA13_QUALITY)) {
+                            base_qual = (base_qual <= 93) ? base_qual - 31 : 0;
+                        }
+
+                        // Return the base and quality
+                        return std::make_tuple(base_as_char(base), base_qual);
+                    }
+                    return std::nullopt; // Position is in the read but base can't be retrieved
+                }
+                read_pos += len;
+                ref_pos += len;
+                break;
+
+            case BAM_CINS:    // I: insertion
+                read_pos += len;
+                break;
+
+            case BAM_CDEL:    // D: deletion
+            case BAM_CREF_SKIP:  // N: skipped region
+                ref_pos += len;
+                break;
+
+            case BAM_CSOFT_CLIP:  // S: soft clipping
+                read_pos += len;
+                break;
+
+            case BAM_CHARD_CLIP:  // H: hard clipping
+                // Hard clips are not in the read sequence
+                break;
+
+            case BAM_CPAD:    // P: padding
+                break;
+
+            default:
+                break;
+        }
+    }
+
+    // If we get here, the position wasn't found in any CIGAR operation
+    return std::nullopt;
+}
+
+// Helper method to process a read at the specified position
+bool BamReader::process_read_at_position(
+    const bam1_t* read,
+    int pos0,
+    std::vector<const bam1_t*>& reads,
+    std::vector<BamAlignment>& alignments,
+    std::vector<char>& bases,
+    std::vector<uint8_t>& qualities,
+    std::unordered_map<const bam1_t*, size_t>& read_indices,
+    int& read_count
+) {
+    // Skip if position is not covered by this read
+    if (pos0 < read->core.pos || pos0 >= bam_endpos(read)) {
+        return false;
+    }
+
+    // Create the alignment object for this read
+    BamAlignment alignment;
+    alignment.query_name = bam_get_qname(read);
+    alignment.chrom = get_sequence_name(read->core.tid);
+    alignment.position = read->core.pos + 1;  // Convert to 1-based
+    alignment.mapping_quality = read->core.qual;
+    alignment.flag = read->core.flag;
+    alignment.is_reverse_strand = (read->core.flag & BAM_FREVERSE) != 0;
+    alignment.cigar_string = get_cigar_string(read);
+    alignment.seq = get_sequence_string(read);
+    alignment.qual = get_quality_string(read);
+
+    alignments.push_back(alignment);
+
+    // Find the base at the position of interest
+    auto base_info = find_base_at_ref_position(read, pos0);
+    if (!base_info) {
+        return false;
+    }
+
+    // Extract the base and quality
+    auto [base_char, base_qual] = *base_info;
+
+    // Store the base and quality for potential overlap detection
+    bases.push_back(base_char);
+    qualities.push_back(base_qual);
+    read_indices[read] = reads.size();
+    reads.push_back(read);
+    read_count++;
+
+    return true;
+}
+
+std::string BamReader::get_cigar_string(const bam1_t* b) const {
+    std::ostringstream cigar_str;
+    uint32_t* cigar = bam_get_cigar(b);
+
+    for (uint32_t i = 0; i < b->core.n_cigar; ++i) {
+        uint32_t op = cigar[i] & BAM_CIGAR_MASK;
+        uint32_t len = cigar[i] >> BAM_CIGAR_SHIFT;
+
+        cigar_str << len;
+
+        switch(op) {
+            case BAM_CMATCH:  cigar_str << 'M'; break;
+            case BAM_CINS:    cigar_str << 'I'; break;
+            case BAM_CDEL:    cigar_str << 'D'; break;
+            case BAM_CREF_SKIP: cigar_str << 'N'; break;
+            case BAM_CSOFT_CLIP: cigar_str << 'S'; break;
+            case BAM_CHARD_CLIP: cigar_str << 'H'; break;
+            case BAM_CPAD:    cigar_str << 'P'; break;
+            case BAM_CEQUAL:  cigar_str << '='; break;
+            case BAM_CDIFF:   cigar_str << 'X'; break;
+            default:          cigar_str << '?'; break;
+        }
+    }
+
+    return cigar_str.str();
+}
+
+std::string BamReader::get_sequence_string(const bam1_t* b) const {
+    std::string seq;
+    seq.reserve(b->core.l_qseq);
+
+    uint8_t* bam_seq = bam_get_seq(b);
+    for (int i = 0; i < b->core.l_qseq; ++i) {
+        seq.push_back(base_as_char(bam_seqi(bam_seq, i)));
+    }
+
+    return seq;
+}
+
+std::string BamReader::get_quality_string(const bam1_t* b) const {
+    std::string qual;
+    qual.reserve(b->core.l_qseq);
+
+    uint8_t* bam_qual = bam_get_qual(b);
+
+    // Check if we need to convert from Illumina 1.3+ encoding
+    if (filter_params_.has_flag(ReadFilterFlag::ILLUMINA13_QUALITY)) {
+        for (int i = 0; i < b->core.l_qseq; ++i) {
+            uint8_t q = bam_qual[i];
+            q = (q <= 93) ? q - 31 : 0; // Convert Illumina 1.3+ to Sanger quality
+            qual.push_back(static_cast<char>(33 + q)); // Convert to Phred+33 ASCII
+        }
+    } else {
+        // Standard Sanger quality
+        for (int i = 0; i < b->core.l_qseq; ++i) {
+            qual.push_back(static_cast<char>(33 + bam_qual[i])); // Convert to Phred+33 ASCII
+        }
+    }
+
+    return qual;
 }
 
 void BamReader::for_each_base_at_position(
@@ -613,43 +586,13 @@ void BamReader::for_each_base_at_position(
     // to prevent iterator_ and read_ from being modified by other threads
     std::lock_guard<std::mutex> lock(mutex_);
 
-    // Set region (directly, without using the public method which would try to acquire the lock again)
-    if (!header_ || !index_) {
+    // Set up an iterator for this genomic position
+    if (!setup_position_iterator(chrom, position)) {
         return;
     }
 
-    // Clean up previous iterator if it exists
-    iterator_.reset();
-
-    // Get chromosome ID from name
-    int tid = bam_name2id(header_.get(), chrom.c_str());
-    if (tid < 0) {
-        return;
-    }
-
-    // Create new iterator for the region
-    iterator_.reset(sam_itr_queryi(index_.get(), tid, position - 1, position)); // 0-based coordinates
-    if (!iterator_) {
-        return;
-    }
-
-    // Need to initialize has_more_reads_ by calling next_read directly here
-    if (!read_) {
-        has_more_reads_ = false;
-        return;
-    }
-
-    // Get the first read
-    int ret;
-    do {
-        ret = sam_itr_next(file_.get(), iterator_.get(), read_.get());
-        if (ret < 0) {
-            has_more_reads_ = false;
-            return;
-        }
-    } while (!passes_filters(read_.get()));
-
-    has_more_reads_ = true;
+    // Convert position to 0-based for internal htslib operations
+    int pos0 = position - 1;
 
     // Process each read overlapping the position
     while (has_more_reads_ && (filter_params_.max_depth <= 0 || read_count < filter_params_.max_depth)) {
@@ -657,132 +600,24 @@ void BamReader::for_each_base_at_position(
 
         // Skip if mapping quality is too low
         if (b->core.qual < mapq_threshold) {
-            do {
-                ret = sam_itr_next(file_.get(), iterator_.get(), read_.get());
-                if (ret < 0) {
-                    has_more_reads_ = false;
-                    break;
-                }
-            } while (!passes_filters(read_.get()));
-
-            has_more_reads_ = (ret >= 0);
-            continue;
-        }
-
-        // Convert position to 0-based
-        int pos0 = position - 1;
-
-        // Skip if position is not covered by this read
-        if (pos0 < b->core.pos || pos0 >= bam_endpos(b)) {
-            do {
-                ret = sam_itr_next(file_.get(), iterator_.get(), read_.get());
-                if (ret < 0) {
-                    has_more_reads_ = false;
-                    break;
-                }
-            } while (!passes_filters(read_.get()));
-
-            has_more_reads_ = (ret >= 0);
-            continue;
-        }
-
-        // Get base and quality at the position
-        uint8_t* seq = bam_get_seq(b);
-        uint8_t* qual = bam_get_qual(b);
-
-        // Find the position in the read that aligns to our position of interest
-        int read_pos = 0;  // Position within the read
-        int ref_pos = b->core.pos;  // Position on the reference
-        uint32_t* cigar = bam_get_cigar(b);
-
-        // Create alignment directly without calling get_current_alignment to avoid recursive locking
-        BamAlignment alignment;
-        alignment.query_name = bam_get_qname(b);
-        alignment.chrom = get_sequence_name(b->core.tid);
-        alignment.position = b->core.pos + 1;  // Convert to 1-based
-        alignment.mapping_quality = b->core.qual;
-        alignment.flag = b->core.flag;
-        alignment.is_reverse_strand = (b->core.flag & BAM_FREVERSE) != 0;
-        alignment.cigar_string = get_cigar_string(b);
-        alignment.seq = get_sequence_string(b);
-        alignment.qual = get_quality_string(b);
-
-        alignments.push_back(alignment);
-
-        // Traverse the CIGAR string
-        for (uint32_t i = 0; i < b->core.n_cigar; ++i) {
-            uint32_t op = cigar[i] & BAM_CIGAR_MASK;
-            uint32_t len = cigar[i] >> BAM_CIGAR_SHIFT;
-
-            switch(op) {
-                case BAM_CMATCH:  // M: match or mismatch
-                case BAM_CEQUAL:  // =: match
-                case BAM_CDIFF:   // X: mismatch
-                    // If our position lies within this CIGAR operation
-                    if (pos0 >= ref_pos && pos0 < ref_pos + static_cast<int>(len)) {
-                        int offset = pos0 - ref_pos;
-                        read_pos += offset;
-
-                        // Get base at this position
-                        int base_idx = read_pos;
-                        if (base_idx >= 0 && base_idx < b->core.l_qseq) {
-                            uint8_t base = bam_seqi(seq, base_idx);
-                            uint8_t base_qual = qual[base_idx];
-
-                            // For Illumina 1.3+ encoding, convert quality
-                            if (filter_params_.has_flag(ReadFilterFlag::ILLUMINA13_QUALITY)) {
-                                base_qual = (base_qual <= 93) ? base_qual - 31 : 0;
-                            }
-
-                            // Store the base and quality for potential overlap detection
-                            bases.push_back(base_as_char(base));
-                            qualities.push_back(base_qual);
-                            read_indices[b] = reads.size();
-                            reads.push_back(b);
-                            read_count++;
-                        }
-                        goto end_cigar_loop;  // We found our position, stop looping
-                    }
-                    read_pos += len;
-                    ref_pos += len;
-                    break;
-
-                case BAM_CINS:    // I: insertion
-                    read_pos += len;
-                    break;
-
-                case BAM_CDEL:    // D: deletion
-                case BAM_CREF_SKIP:  // N: skipped region
-                    ref_pos += len;
-                    break;
-
-                case BAM_CSOFT_CLIP:  // S: soft clipping
-                    read_pos += len;
-                    break;
-
-                case BAM_CHARD_CLIP:  // H: hard clipping
-                    // Hard clips are not in the read sequence
-                    break;
-
-                case BAM_CPAD:    // P: padding
-                    break;
-
-                default:
-                    break;
-            }
-        }
-
-end_cigar_loop:
-        // Get the next read without using next_read() since we already have the lock
-        do {
-            ret = sam_itr_next(file_.get(), iterator_.get(), read_.get());
-            if (ret < 0) {
-                has_more_reads_ = false;
+            if (!fetch_next_filtered_read(mapq_threshold)) {
                 break;
             }
-        } while (!passes_filters(read_.get()));
+            continue;
+        }
 
-        has_more_reads_ = (ret >= 0);
+        // Process the current read at the specified position
+        if (process_read_at_position(b, pos0, reads, alignments, bases, qualities, read_indices, read_count)) {
+            // If we processed a read successfully, fetch the next one
+            if (!fetch_next_filtered_read(mapq_threshold)) {
+                break;
+            }
+        } else {
+            // If the read doesn't cover the position, move to the next one
+            if (!fetch_next_filtered_read(mapq_threshold)) {
+                break;
+            }
+        }
     }
 
     // Handle overlapping pairs if needed
@@ -873,101 +708,4 @@ void BamReader::handle_overlapping_pairs(
             }
         }
     }
-}
-
-PileupData BamReader::get_pileup_at_position(
-    const std::string& chrom,
-    int32_t position,
-    int min_base_quality,
-    int min_mapping_quality
-) {
-    PileupData pileup;
-    pileup.chrom = chrom;
-    pileup.position = position;
-
-    for_each_base_at_position(
-        chrom,
-        position,
-        [&pileup](char base_char, uint8_t base_quality, const BamAlignment* alignment) {
-            pileup.bases.push_back(base_char);
-            pileup.qualities.push_back(base_quality);
-            if (alignment) {
-                pileup.alignments.push_back(*alignment);
-            }
-        },
-        min_base_quality,
-        min_mapping_quality
-    );
-
-    return pileup;
-}
-
-bool BamReader::has_index() const {
-    return index_ != nullptr;
-}
-
-std::string BamReader::get_filename() const {
-    return filename_;
-}
-
-std::string BamReader::get_cigar_string(const bam1_t* b) const {
-    std::ostringstream cigar_str;
-    uint32_t* cigar = bam_get_cigar(b);
-
-    for (uint32_t i = 0; i < b->core.n_cigar; ++i) {
-        uint32_t op = cigar[i] & BAM_CIGAR_MASK;
-        uint32_t len = cigar[i] >> BAM_CIGAR_SHIFT;
-
-        cigar_str << len;
-
-        switch(op) {
-            case BAM_CMATCH:  cigar_str << 'M'; break;
-            case BAM_CINS:    cigar_str << 'I'; break;
-            case BAM_CDEL:    cigar_str << 'D'; break;
-            case BAM_CREF_SKIP: cigar_str << 'N'; break;
-            case BAM_CSOFT_CLIP: cigar_str << 'S'; break;
-            case BAM_CHARD_CLIP: cigar_str << 'H'; break;
-            case BAM_CPAD:    cigar_str << 'P'; break;
-            case BAM_CEQUAL:  cigar_str << '='; break;
-            case BAM_CDIFF:   cigar_str << 'X'; break;
-            default:          cigar_str << '?'; break;
-        }
-    }
-
-    return cigar_str.str();
-}
-
-std::string BamReader::get_sequence_string(const bam1_t* b) const {
-    std::string seq;
-    seq.reserve(b->core.l_qseq);
-
-    uint8_t* bam_seq = bam_get_seq(b);
-    for (int i = 0; i < b->core.l_qseq; ++i) {
-        seq.push_back(base_as_char(bam_seqi(bam_seq, i)));
-    }
-
-    return seq;
-}
-
-std::string BamReader::get_quality_string(const bam1_t* b) const {
-    std::string qual;
-    qual.reserve(b->core.l_qseq);
-
-    uint8_t* bam_qual = bam_get_qual(b);
-
-    // Check if we need to convert from Illumina 1.3+ encoding
-    if (filter_params_.has_flag(ReadFilterFlag::ILLUMINA13_QUALITY)) {
-        for (int i = 0; i < b->core.l_qseq; ++i) {
-            uint8_t q = bam_qual[i];
-            q = (q <= 93) ? q - 31 : 0; // Convert Illumina 1.3+ to Sanger quality
-            qual.push_back(static_cast<char>(33 + q)); // Convert to Phred+33 ASCII
-        }
-    } else {
-        // Standard Sanger quality
-        for (int i = 0; i < b->core.l_qseq; ++i) {
-            qual.push_back(static_cast<char>(33 + bam_qual[i])); // Convert to Phred+33 ASCII
-        }
-    }
-
-    return qual;
 }
